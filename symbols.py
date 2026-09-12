@@ -87,6 +87,15 @@ def get_all_symbols(refresh: bool = False) -> list[str]:
     return sorted(_load(refresh=refresh).keys())
 
 
+def get_nasdaq_symbols(refresh: bool = False) -> list[str]:
+    """Return only tickers listed on the Nasdaq exchange."""
+    meta = _load(refresh=refresh)
+    return sorted(
+        sym for sym, info in meta.items()
+        if info.get("Exchange", "").upper() == "NASDAQ"
+    )
+
+
 def get_symbol_metadata(refresh: bool = False) -> dict[str, dict[str, str]]:
     """Return {symbol: {'FullName': ..., 'Exchange': ...}} for all tickers."""
     return _load(refresh=refresh)

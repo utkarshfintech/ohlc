@@ -10,6 +10,9 @@ import pyodbc
 
 from config import settings
 
+DEFAULT_TABLE = "us_stock_historic_ohlc"
+NASDAQ_TABLE = "us_nasdaq_ohlc"
+
 CREATE_TABLE_SQL = """
 IF OBJECT_ID('dbo.us_stock_historic_ohlc', 'U') IS NOT NULL
     DROP TABLE dbo.us_stock_historic_ohlc;
@@ -38,26 +41,79 @@ CREATE UNIQUE INDEX UX_us_stock_historic_ohlc_Symbol_Timestamp
     ON dbo.us_stock_historic_ohlc (Symbol, Timestamp);
 """
 
+# Mirrors the live "UsStockOhlc" (NYSE) table so Nasdaq rows look identical.
+# Created only if missing (never drops), with a unique (Symbol, Timestamp) guard.
+CREATE_NASDAQ_TABLE_SQL = """
+IF OBJECT_ID('dbo.us_nasdaq_ohlc', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.us_nasdaq_ohlc (
+        Id        INT           IDENTITY(1,1) NOT NULL,
+        Symbol    NVARCHAR(60)  NOT NULL,
+        ISIN      NVARCHAR(50)  NULL,
+        Currency  VARCHAR(20)   NULL,
+        FullName  VARCHAR(1000) NULL,
+        Exchange  VARCHAR(20)   NULL,
+        Timestamp BIGINT        NULL,
+        [Date]    DATETIME      NULL,
+        [Open]    FLOAT         NULL,
+        High      FLOAT         NULL,
+        Low       FLOAT         NULL,
+        [Close]   FLOAT         NULL,
+        AdjClose  FLOAT         NULL,
+        Volume    BIGINT        NULL,
+        CreatedAt NVARCHAR(60)  NULL DEFAULT CONVERT(NVARCHAR(60), SYSUTCDATETIME(), 121),
+        UpdatedAt NVARCHAR(60)  NULL DEFAULT CONVERT(NVARCHAR(60), SYSUTCDATETIME(), 121),
+        CONSTRAINT PK_us_nasdaq_ohlc PRIMARY KEY (Id)
+    );
+
+    CREATE UNIQUE INDEX UX_us_nasdaq_ohlc_Symbol_Timestamp
+        ON dbo.us_nasdaq_ohlc (Symbol, Timestamp);
+END;
+"""
+
 
 class SQLServerStore:
     """Persists OHLC DataFrames into SQL Server."""
 
-    def __init__(self, use_bulk: bool = True) -> None:
+    def __init__(self, use_bulk: bool = True, table: str = DEFAULT_TABLE) -> None:
         self.use_bulk = use_bulk
+        self.table = table
+
+    @staticmethod
+    def _tbl(table: str) -> str:
+        return f"[dbo].[{table}]"
 
     def _connect(self) -> pyodbc.Connection:
         return pyodbc.connect(settings.connection_string, autocommit=False)
 
-    def init_schema(self) -> None:
+    def init_schema(self, table: str | None = None) -> None:
+        table = table or self.table
+        if table == DEFAULT_TABLE:
+            sql = CREATE_TABLE_SQL
+        elif table == NASDAQ_TABLE:
+            sql = CREATE_NASDAQ_TABLE_SQL
+        else:
+            raise ValueError(f"Unsupported table name: {table}")
         with self._connect() as conn:
-            conn.execute(CREATE_TABLE_SQL)
+            conn.execute(sql)
             conn.commit()
 
     def existing_symbols(self) -> set[str]:
         with self._connect() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT Symbol FROM dbo.us_stock_historic_ohlc")
+            cursor.execute(
+                f"SELECT DISTINCT Symbol FROM {self._tbl(self.table)}"
+            )
             return {row[0] for row in cursor.fetchall()}
+
+    def existing_timestamps(self, symbol: str) -> set[int]:
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"SELECT Timestamp FROM {self._tbl(self.table)} WHERE Symbol = ?",
+                symbol,
+            )
+            return {int(row[0]) for row in cursor.fetchall()}
 
     def save(
         self,
@@ -74,26 +130,29 @@ class SQLServerStore:
         if df is None or df.empty:
             return 0
 
-        rows = [row for row in self._iter_rows(symbol, df, meta)]
+        now = _timestamp_str()
+        rows = [row for row in self._iter_rows(symbol, df, meta, now)]
         if not rows:
             return 0
 
+        table = self._tbl(self.table)
         with self._connect() as conn:
             cursor = conn.cursor()
             if replace:
                 cursor.execute(
-                    "DELETE FROM dbo.us_stock_historic_ohlc WHERE Symbol = ?",
+                    f"DELETE FROM {table} WHERE Symbol = ?",
                     symbol,
                 )
 
             if self.use_bulk:
                 cursor.fast_executemany = True
 
-            insert_sql = """
-                INSERT INTO dbo.us_stock_historic_ohlc
+            insert_sql = f"""
+                INSERT INTO {table}
                     (Symbol, ISIN, Currency, FullName, Exchange,
-                     Timestamp, [Date], [Open], High, Low, [Close], AdjClose, Volume)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     Timestamp, [Date], [Open], High, Low, [Close], AdjClose, Volume,
+                     CreatedAt, UpdatedAt)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
             cursor.executemany(insert_sql, rows)
             conn.commit()
@@ -101,7 +160,7 @@ class SQLServerStore:
 
     @staticmethod
     def _iter_rows(
-        symbol: str, df: pd.DataFrame, meta: dict | None
+        symbol: str, df: pd.DataFrame, meta: dict | None, now: str
     ) -> Iterable[tuple]:
         meta = meta or {}
         timestamp_col = "Timestamp" if "Timestamp" in df.columns else None
@@ -122,7 +181,14 @@ class SQLServerStore:
                 _decimal(r.get("Close")),
                 _decimal(r.get("AdjClose")),
                 _bigint(r.get("Volume")),
+                now,
+                now,
             )
+
+
+def _timestamp_str() -> str:
+    """UTC now as a 7-digit-fraction string, matching CONVERT(...,121)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f") + "0"
 
 
 def _as_naive_dt(value) -> datetime | None:

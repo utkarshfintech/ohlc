@@ -20,8 +20,8 @@ import time
 import yfinance as yf
 
 from fetcher import OHLCFetcher
-from store import SQLServerStore
-from symbols import get_all_symbols, get_symbol_metadata
+from store import DEFAULT_TABLE, NASDAQ_TABLE, SQLServerStore
+from symbols import get_all_symbols, get_nasdaq_symbols, get_symbol_metadata
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 5.0
@@ -39,14 +39,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("symbols", nargs="*", help="Stock tickers, e.g. AAPL MSFT")
     parser.add_argument("--all", action="store_true",
                         help="Fetch every US-listed symbol from the Nasdaq Trader directory")
+    parser.add_argument("--nasdaq", action="store_true",
+                        help="Fetch only Nasdaq-listed symbols into dbo.us_nasdaq_ohlc")
     parser.add_argument("--limit", type=int, default=0,
-                        help="Stop after processing N symbols (useful with --all)")
+                        help="Stop after processing N symbols (useful with --all/--nasdaq)")
     parser.add_argument("--delay", type=float, default=0.1,
                         help="Seconds to wait between Yahoo requests (rate limiting)")
     parser.add_argument("--refresh-symbols", action="store_true",
                         help="Re-download the Nasdaq symbol directory instead of using the cache")
     parser.add_argument("--replace", action="store_true",
                         help="Delete existing rows for the symbol before inserting")
+    parser.add_argument("--resume", action="store_true",
+                        help="Insert only missing rows per symbol instead of skipping "
+                             "whole symbols already in the DB (recovers interrupted loads)")
     parser.add_argument("--no-bulk", action="store_true",
                         help="Disable fast_executemany bulk inserts")
     parser.add_argument("--init-schema", action="store_true",
@@ -87,21 +92,27 @@ def fetch_with_retry(fetcher: OHLCFetcher, symbol: str, start: int, end: int):
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    store = SQLServerStore(use_bulk=not args.no_bulk)
+
+    table = NASDAQ_TABLE if args.nasdaq else DEFAULT_TABLE
+    store = SQLServerStore(use_bulk=not args.no_bulk, table=table)
 
     if args.init_schema:
         store.init_schema()
         print("Schema ready.")
         return 0
 
-    if args.all:
+    if args.nasdaq:
+        symbols = get_nasdaq_symbols(refresh=args.refresh_symbols)
+        meta_all = get_symbol_metadata(refresh=args.refresh_symbols)
+        if not symbols:
+            print("Symbol directory empty — could not load any Nasdaq symbols.", file=sys.stderr)
+            return 2
+    elif args.all:
         symbols = get_all_symbols(refresh=args.refresh_symbols)
+        meta_all = get_symbol_metadata(refresh=args.refresh_symbols)
         if not symbols:
             print("Symbol directory empty — could not load any symbols.", file=sys.stderr)
             return 2
-        if args.limit:
-            symbols = symbols[: args.limit]
-        meta_all = get_symbol_metadata(refresh=args.refresh_symbols)
     else:
         if not args.symbols:
             # Bare `python main.py` after a truncate means "fetch everything".
@@ -112,7 +123,12 @@ def main(argv: list[str] | None = None) -> int:
             symbols = args.symbols
             meta_all = {}
 
-    existing = store.existing_symbols() if not args.replace else set()
+    if args.limit:
+        symbols = symbols[: args.limit]
+
+    existing = set() if args.replace else store.existing_symbols()
+    if args.resume:
+        existing = set()
     fetcher = OHLCFetcher()
     total = 0
     fetched = 0
@@ -122,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"Processing {len(symbols)} symbols for "
-        f"{START_DATE_EPOCH} -> {END_DATE_EPOCH} (ts) ..."
+        f"{START_DATE_EPOCH} -> {END_DATE_EPOCH} (ts) into {store.table} ..."
     )
     for idx, symbol in enumerate(symbols, start=1):
         if symbol in existing:
@@ -140,6 +156,15 @@ def main(argv: list[str] | None = None) -> int:
             no_data += 1
             print(f"[{idx}/{len(symbols)}] {symbol}: no data")
             continue
+
+        if args.resume:
+            present = store.existing_timestamps(symbol)
+            if present:
+                df = df[~df["Timestamp"].isin(present)]
+                if df.empty:
+                    skipped += 1
+                    print(f"[{idx}/{len(symbols)}] {symbol}: already complete ({len(present)} rows)")
+                    continue
 
         meta = dict(meta_all.get(symbol, {}))
         meta.setdefault("Currency", fetch_currency(symbol))
