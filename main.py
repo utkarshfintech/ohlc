@@ -14,6 +14,7 @@ Fetch every US-listed symbol from the Nasdaq Trader directory
 from __future__ import annotations
 
 import argparse
+import random
 import sys
 import time
 
