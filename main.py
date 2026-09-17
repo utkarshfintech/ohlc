@@ -117,6 +117,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Stop after processing N symbols (useful with --all/--nasdaq)")
     parser.add_argument("--delay", type=float, default=0.1,
                         help="Seconds to wait between Yahoo requests (rate limiting)")
+    parser.add_argument("--no-meta", action="store_true",
+                        help="Skip Currency/ISIN lookups (the v10 quoteSummary "
+                             "endpoint is far more aggressively 401-blocked than "
+                             "the chart endpoint) — keeps every run at ~1 "
+                             "request/symbol on the allowed endpoint")
     parser.add_argument("--refresh-symbols", action="store_true",
                         help="Re-download the Nasdaq symbol directory instead of using the cache")
     parser.add_argument("--replace", action="store_true",
@@ -252,17 +257,21 @@ def main(argv: list[str] | None = None) -> int:
                     continue
 
         meta = dict(meta_all.get(symbol, {}))
-        meta.setdefault("Currency", fetch_currency(symbol))
-        isin = fetch_isin(symbol)
-        if isin:
-            meta["ISIN"] = isin
+        if not args.no_meta:
+            meta.setdefault("Currency", fetch_currency(symbol))
+            isin = fetch_isin(symbol)
+            if isin:
+                meta["ISIN"] = isin
         written = store.save(symbol, df, meta=meta, replace=args.replace)
         fetched += 1
         total += written
         print(f"[{idx}/{len(symbols)}] {symbol}: {len(df)} rows -> {written}")
 
         if args.delay:
-            time.sleep(args.delay)
+            # Human-jittered pacing: Yahoo flags machine-precise fixed timing as
+            # a bot. Each sleep is delay * (0.75 .. 1.25) so the inter-request
+            # rhythm is irregular and indistinguishable from a browsing user.
+            time.sleep(args.delay * random.uniform(0.75, 1.25))
 
     print(
         f"Done. Symbols processed: {fetched}, rows written: {total}, "
