@@ -204,10 +204,12 @@ def _as_naive_dt(value) -> datetime | None:
             value = value.to_pydatetime()
         if value is None or value != value:  # NaN
             return None
+        if isinstance(value, str):  # "2026-01-02" or "" -> parse or NULL
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if value.tzinfo is not None:
             return value.astimezone(timezone.utc).replace(tzinfo=None)
         return value
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, AttributeError):  # incl. "" / bad string
         return None
 
 
