@@ -19,8 +19,28 @@ import time
 
 import yfinance as yf
 
+from fetcher import OHLCFetcher, OHLCFetcher as _OHLCFetcherAlias
 from fetcher import OHLCFetcher
-from store import DEFAULT_TABLE, NASDAQ_TABLE, SQLServerStore
+from markets import (
+    get_euronext_symbols,
+    get_fwb_symbols,
+    get_hang_seng_symbols,
+    get_krx_symbols,
+    get_lse_symbols,
+    get_tse_symbols,
+)
+from store import (
+    DEFAULT_TABLE,
+    EURONEXT_TABLE,
+    FWB_TABLE,
+    HKEX_TABLE,
+    KRX_KOSDAQ_TABLE,
+    KRX_KOSPI_TABLE,
+    LSE_TABLE,
+    NASDAQ_TABLE,
+    SQLServerStore,
+    TSE_TABLE,
+)
 from symbols import get_all_symbols, get_nasdaq_symbols, get_symbol_metadata
 
 MAX_RETRIES = 3
@@ -28,7 +48,55 @@ RETRY_BACKOFF_SECONDS = 5.0
 
 # Yahoo Unix-epoch timestamps (seconds) for the backfill window.
 START_DATE_EPOCH = 345427200  # 1980-12-12 00:00:00 UTC
-END_DATE_EPOCH = 1788825600   # 2026-09-08 00:00:00 UTC
+END_DATE_EPOCH = 1789603200  # 2026-09-17 00:00:00 UTC
+
+# International market -> its own table + its symbol directory getter.
+MARKET_GETTERS = {
+    "euronext": get_euronext_symbols,
+    "lse": get_lse_symbols,
+    "fwb": get_fwb_symbols,
+    "hkex": get_hang_seng_symbols,
+    "tse": get_tse_symbols,
+    "kospi": lambda refresh=False: get_krx_symbols("kospi", refresh=refresh),
+    "kosdaq": lambda refresh=False: get_krx_symbols("kosdaq", refresh=refresh),
+}
+
+# Natural short names / alternate spellings -> the canonical market key, so
+# `--market hs` (Hang Seng), `--market krx`, `--market lon`, etc. all work.
+MARKET_ALIASES = {
+    "hs": "hkex",
+    "hsi": "hkex",
+    "hang_seng": "hkex",
+    "hk": "hkex",
+    "hkg": "hkex",
+    "hong_kong": "hkex",
+    "krx": "kospi",
+    "seoul": "kospi",
+    "kq": "kosdaq",
+    "lon": "lse",
+    "london": "lse",
+    "fra": "fwb",
+    "frankfurt": "fwb",
+    "xetra": "fwb",
+    "tokyo": "tse",
+    "jpx": "tse",
+    "epa": "euronext",
+    "ams": "euronext",
+    "brx": "euronext",
+}
+
+# Every legal value for --market, canonical + aliases (canonical names win on ties).
+MARKET_CHOICES = sorted(set(MARKET_GETTERS) | set(MARKET_ALIASES))
+
+MARKET_DISPATCH = {
+    "euronext": (EURONEXT_TABLE, get_euronext_symbols),
+    "lse": (LSE_TABLE, get_lse_symbols),
+    "fwb": (FWB_TABLE, get_fwb_symbols),
+    "hkex": (HKEX_TABLE, get_hang_seng_symbols),
+    "tse": (TSE_TABLE, get_tse_symbols),
+    "kospi": (KRX_KOSPI_TABLE, lambda refresh=False: get_krx_symbols("kospi", refresh=refresh)),
+    "kosdaq": (KRX_KOSDAQ_TABLE, lambda refresh=False: get_krx_symbols("kosdaq", refresh=refresh)),
+}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -41,6 +109,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Fetch every US-listed symbol from the Nasdaq Trader directory")
     parser.add_argument("--nasdaq", action="store_true",
                         help="Fetch only Nasdaq-listed symbols into dbo.us_nasdaq_ohlc")
+    parser.add_argument("--market", choices=MARKET_CHOICES,
+                        help="Fetch an international market into its own table. "
+                             "Canonical: euronext, lse, fwb, hkex, tse, kospi, kosdaq "
+                             "(aliases like hs, hsi, krx, lon, fra, tokyo also work)")
     parser.add_argument("--limit", type=int, default=0,
                         help="Stop after processing N symbols (useful with --all/--nasdaq)")
     parser.add_argument("--delay", type=float, default=0.1,
@@ -56,7 +128,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Disable fast_executemany bulk inserts")
     parser.add_argument("--init-schema", action="store_true",
                         help="Create the table/index if missing, then exit")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.market:
+        args.market = MARKET_ALIASES.get(args.market, args.market)
+    return args
 
 
 def fetch_currency(symbol: str) -> str | None:
@@ -93,7 +168,10 @@ def fetch_with_retry(fetcher: OHLCFetcher, symbol: str, start: int, end: int):
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    table = NASDAQ_TABLE if args.nasdaq else DEFAULT_TABLE
+    if args.market:
+        table, symbols_getter = MARKET_DISPATCH[args.market]
+    else:
+        table = NASDAQ_TABLE if args.nasdaq else DEFAULT_TABLE
     store = SQLServerStore(use_bulk=not args.no_bulk, table=table)
 
     if args.init_schema:
@@ -101,7 +179,14 @@ def main(argv: list[str] | None = None) -> int:
         print("Schema ready.")
         return 0
 
-    if args.nasdaq:
+    if args.market:
+        meta_all = symbols_getter(refresh=args.refresh_symbols)
+        symbols = list(meta_all)
+        if not symbols:
+            print(f"Symbol directory empty — could not load any {args.market} symbols.",
+                  file=sys.stderr)
+            return 2
+    elif args.nasdaq:
         symbols = get_nasdaq_symbols(refresh=args.refresh_symbols)
         meta_all = get_symbol_metadata(refresh=args.refresh_symbols)
         if not symbols:

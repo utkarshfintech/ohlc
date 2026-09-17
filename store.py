@@ -12,6 +12,13 @@ from config import settings
 
 DEFAULT_TABLE = "us_stock_historic_ohlc"
 NASDAQ_TABLE = "us_nasdaq_ohlc"
+EURONEXT_TABLE = "EURONEXT_historic_ohlc"
+LSE_TABLE = "LSE_historic_ohlc"
+FWB_TABLE = "FWB_historic_ohlc"
+HKEX_TABLE = "HKEX_historic_ohlc"
+TSE_TABLE = "TSE_historic_ohlc"
+KRX_KOSPI_TABLE = "KRX_KOSPI_historic_ohlc"
+KRX_KOSDAQ_TABLE = "KRX_KOSDAQ_historic_ohlc"
 
 CREATE_TABLE_SQL = """
 IF OBJECT_ID('dbo.us_stock_historic_ohlc', 'U') IS NOT NULL
@@ -207,7 +214,7 @@ def _as_naive_dt(value) -> datetime | None:
 def _str(value) -> str | None:
     if value is None or value != value:  # NaN
         return None
-    return str(value)
+    return str(value).strip() or None  # empty/whitespace -> SQL NULL (never "")
 
 
 def _decimal(value) -> float | None:
